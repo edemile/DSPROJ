@@ -2,54 +2,108 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 import boto3
+import io
 from datetime import datetime
+import pymysql
 
-# Streamlit 
+# Streamlit layout
 st.set_page_config(page_title="Nutrition Tracker", layout="wide")
 st.title("🥗 Nutrition Progress Tracker")
-st.markdown("Upload a food log (Excel) to calculate and visualize your nutrient intake over time.")
+st.markdown("Upload a food log (.xlsx) to calculate and visualize your nutrient intake over time.")
 
-s3 = boto3.client("s3")  # uses ~/.aws/credentials or IAM role
+# --- AWS + S3 config ---
+s3 = boto3.client("s3")
 BUCKET_NAME = "raw-food-logs"
 
+# --- RDS connection ---
+def get_db_connection():
+    return pymysql.connect(
+        host="nutrition-database.cqdcmmewsh2e.us-east-1.rds.amazonaws.com",
+        user="admin",
+        password="J26u4403!",
+        database="nutrition_tracker",
+        cursorclass=pymysql.cursors.DictCursor
+    )
 
+def insert_summary_to_rds(summary_df):
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            for _, row in summary_df.iterrows():
+                cursor.execute("""
+                    INSERT INTO nutrient_log (
+                        log_date, calories, total_fat, sodium, calcium, iron,
+                        potassium, protein, carbohydrates, fiber, sugar, water
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    row['date'], row['calories'], row['total_fat'], row['sodium'], row['calcium'],
+                    row['iron'], row['potassium'], row['protein'], row['carbohydrates'],
+                    row['fiber'], row['sugar'], row['water']
+                ))
+        conn.commit()
+        conn.close()
+        st.success("✅ Summary saved to RDS")
+    except Exception as e:
+        st.error(f"❌ Failed to insert into RDS: {e}")
+
+# --- File Upload ---
 uploaded_file = st.file_uploader("📤 Upload your food log (.xlsx)", type=["xlsx"])
 
 if uploaded_file:
-    # Upload to S3 with timestamp in filename
     timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
     s3_key = f"uploads/user_upload_{timestamp}.xlsx"
 
     try:
-        s3.upload_fileobj(uploaded_file, BUCKET_NAME, s3_key)
-        st.success(f"✅ File uploaded to S3: `{s3_key}`")
-    except Exception as s3_error:
-        st.error(f"❌ Failed to upload file to S3: {s3_error}")
+        file_bytes = uploaded_file.read()
+        buffer = io.BytesIO(file_bytes)
 
-    try:
-        # Read uploaded Excel file
-        user_df = pd.read_excel(uploaded_file)
+        # Upload to S3
+        s3.upload_fileobj(io.BytesIO(file_bytes), BUCKET_NAME, s3_key)
+        st.success(f"✅ File uploaded to S3: `{s3_key}`")
+
+        # Read Excel
+        buffer.seek(0)
+        user_df = pd.read_excel(buffer)
         user_df.columns = user_df.columns.str.strip().str.lower()
 
         if not {"date", "name", "amount"}.issubset(user_df.columns):
             st.error("Excel must have columns: 'date', 'name', 'amount'")
         else:
-            # Load nutrition data
             nutrition_df = pd.read_csv("nutrition_facts.csv")
             nutrition_df.columns = nutrition_df.columns.str.strip().str.lower()
-            nutrition_df = nutrition_df.rename(columns={"irom": "iron"})
 
-            # Merge and scale nutrients
-            merged = pd.merge(user_df, nutrition_df, on="name")
+            # Rename problem columns
+            nutrition_df = nutrition_df.rename(columns={
+                "irom": "iron",
+                "sugars": "sugar",
+                "carbohydrate": "carbohydrates"
+            })
+
+            # Merge
+            merged = pd.merge(user_df, nutrition_df, on="name", how="inner")
             merged["date"] = pd.to_datetime(merged["date"])
-            nutrient_cols = [col for col in merged.columns if col not in {"name", "serving_size", "date", "amount"}]
+
+            nutrient_cols = [
+                "calories", "total_fat", "sodium", "calcium", "iron", "potassium",
+                "protein", "carbohydrates", "fiber", "sugar", "water"
+            ]
+
+            # Double-check existence
+            for col in nutrient_cols:
+                if col not in merged.columns:
+                    st.error(f"Missing expected column in merged data: {col}")
+                    st.stop()
+
             for col in nutrient_cols:
                 merged[col] = (merged[col] * merged["amount"]) / 100
 
-            # Aggregate by day
             summary = merged.groupby("date")[nutrient_cols].sum().reset_index()
 
-            # results
+            # Insert to RDS
+            insert_summary_to_rds(summary)
+
+            # UI
             st.subheader("📋 Daily Nutrient Totals")
             st.dataframe(summary.style.format(precision=2))
 
