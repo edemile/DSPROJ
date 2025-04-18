@@ -47,6 +47,18 @@ def insert_summary_to_rds(summary_df):
     except Exception as e:
         st.error(f"❌ Failed to insert into RDS: {e}")
 
+def get_all_nutrient_data():
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM nutrient_log ORDER BY log_date ASC")
+            rows = cursor.fetchall()
+        conn.close()
+        return pd.DataFrame(rows)
+    except Exception as e:
+        st.error(f"❌ Failed to fetch data from RDS: {e}")
+        return pd.DataFrame()
+
 # --- File Upload ---
 uploaded_file = st.file_uploader("📤 Upload your food log (.xlsx)", type=["xlsx"])
 
@@ -103,19 +115,26 @@ if uploaded_file:
             # Insert to RDS
             insert_summary_to_rds(summary)
 
-            # UI
-            st.subheader("📋 Daily Nutrient Totals")
-            st.dataframe(summary.style.format(precision=2))
-
-            st.subheader("📈 Nutrient Trends Over Time")
-            for col in nutrient_cols:
-                st.markdown(f"**{col.capitalize()}**")
-                chart = alt.Chart(summary).mark_line(point=True).encode(
-                    x='date:T',
-                    y=alt.Y(f'{col}:Q', title=col.capitalize()),
-                    tooltip=['date', col]
-                ).properties(width=700, height=300)
-                st.altair_chart(chart, use_container_width=True)
-
     except Exception as e:
         st.error(f"❌ Something went wrong: {e}")
+
+# --- Always show full historical data from RDS ---
+summary = get_all_nutrient_data()
+if not summary.empty:
+    summary.rename(columns={"log_date": "date"}, inplace=True)
+
+    st.subheader("📋 All-Time Nutrient Totals")
+    st.dataframe(summary.style.format(precision=2))
+
+    st.subheader("📈 Nutrient Trends Over Time")
+    for col in [
+        "calories", "total_fat", "sodium", "calcium", "iron", "potassium",
+        "protein", "carbohydrates", "fiber", "sugar", "water"
+    ]:
+        st.markdown(f"**{col.capitalize()}**")
+        chart = alt.Chart(summary).mark_line(point=True).encode(
+            x='date:T',
+            y=alt.Y(f'{col}:Q', title=col.capitalize()),
+            tooltip=['date', col]
+        ).properties(width=700, height=300)
+        st.altair_chart(chart, use_container_width=True)
